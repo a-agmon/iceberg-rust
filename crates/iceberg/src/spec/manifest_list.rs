@@ -23,7 +23,9 @@ use crate::io::FileIO;
 use crate::{io::OutputFile, spec::Literal, Error, ErrorKind};
 use apache_avro::{from_value, types::Value, Reader, Writer};
 use futures::{AsyncReadExt, AsyncWriteExt};
+use parquet::column::reader;
 
+use self::_const_schema::MANIFEST_LIST_AVRO_SCHEMA_V2_COMPAT;
 use self::{
     _const_schema::{MANIFEST_LIST_AVRO_SCHEMA_V1, MANIFEST_LIST_AVRO_SCHEMA_V2},
     _serde::{ManifestFileV1, ManifestFileV2},
@@ -69,8 +71,22 @@ impl ManifestList {
             }
             FormatVersion::V2 => {
                 let reader = Reader::with_schema(&MANIFEST_LIST_AVRO_SCHEMA_V2, bs)?;
-                let values = Value::Array(reader.collect::<std::result::Result<Vec<Value>, _>>()?);
-                from_value::<_serde::ManifestListV2>(&values)?.try_into(partition_type_provider)
+                let read_result = reader.collect::<std::result::Result<Vec<Value>, _>>();
+                match read_result {
+                    Ok(records) => {
+                        let values = Value::Array(records);
+                        from_value::<_serde::ManifestListV2>(&values)?
+                            .try_into(&partition_type_provider)
+                    }
+                    Err(e) => {
+                        println!("Error reading values fallling back to V2_COMAPT: {:?}", e);
+                        let reader = Reader::with_schema(&MANIFEST_LIST_AVRO_SCHEMA_V2_COMPAT, bs)?;
+                        let records = reader.collect::<std::result::Result<Vec<Value>, _>>()?;
+                        let values = Value::Array(records);
+                        from_value::<_serde::ManifestListV2Compat>(&values)?
+                            .try_into(&partition_type_provider)
+                    }
+                }
             }
         }
     }
@@ -297,7 +313,7 @@ mod _const_schema {
         Lazy::new(|| {
             Arc::new(NestedField::required(
                 504,
-                "added_data_files_count",
+                "added_files_count",
                 Type::Primitive(PrimitiveType::Int),
             ))
         })
@@ -315,7 +331,7 @@ mod _const_schema {
         Lazy::new(|| {
             Arc::new(NestedField::required(
                 505,
-                "existing_data_files_count",
+                "existing_files_count",
                 Type::Primitive(PrimitiveType::Int),
             ))
         })
@@ -333,7 +349,7 @@ mod _const_schema {
         Lazy::new(|| {
             Arc::new(NestedField::required(
                 506,
-                "deleted_data_files_count",
+                "deleted_files_count",
                 Type::Primitive(PrimitiveType::Int),
             ))
         })
@@ -491,11 +507,37 @@ mod _const_schema {
         })
     };
 
+    static V2_SCHEMA_COMPAT: Lazy<Schema> = {
+        Lazy::new(|| {
+            let fields = vec![
+                MANIFEST_PATH.clone(),
+                MANIFEST_LENGTH.clone(),
+                PARTITION_SPEC_ID.clone(),
+                CONTENT.clone(),
+                SEQUENCE_NUMBER.clone(),
+                MIN_SEQUENCE_NUMBER.clone(),
+                ADDED_SNAPSHOT_ID.clone(),
+                ADDED_FILES_COUNT_V1.clone(),
+                EXISTING_FILES_COUNT_V1.clone(),
+                DELETED_FILES_COUNT_V1.clone(),
+                ADDED_ROWS_COUNT_V2.clone(),
+                EXISTING_ROWS_COUNT_V2.clone(),
+                DELETED_ROWS_COUNT_V2.clone(),
+                PARTITIONS.clone(),
+                KEY_METADATA.clone(),
+            ];
+            Schema::builder().with_fields(fields).build().unwrap()
+        })
+    };
+
     pub(super) static MANIFEST_LIST_AVRO_SCHEMA_V1: Lazy<AvroSchema> =
         Lazy::new(|| schema_to_avro_schema("manifest_file", &V1_SCHEMA).unwrap());
 
     pub(super) static MANIFEST_LIST_AVRO_SCHEMA_V2: Lazy<AvroSchema> =
         Lazy::new(|| schema_to_avro_schema("manifest_file", &V2_SCHEMA).unwrap());
+
+    pub(super) static MANIFEST_LIST_AVRO_SCHEMA_V2_COMPAT: Lazy<AvroSchema> =
+        Lazy::new(|| schema_to_avro_schema("manifest_file", &V2_SCHEMA_COMPAT).unwrap());
 }
 
 /// Entry in a manifest list.
@@ -698,6 +740,12 @@ pub(super) mod _serde {
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(transparent)]
+    pub(crate) struct ManifestListV2Compat {
+        entries: Vec<ManifestFileV2Compat>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(transparent)]
     pub(crate) struct ManifestListV1 {
         entries: Vec<ManifestFileV1>,
     }
@@ -743,7 +791,49 @@ pub(super) mod _serde {
             })
         }
     }
+    // ---
+    impl ManifestListV2Compat {
+        /// Converts the [ManifestListV2Compat] into a [ManifestList].
+        /// The convert of [entries] need the partition_type info so use this function instead of [std::TryFrom] trait.
+        pub fn try_into(
+            self,
+            partition_type_provider: impl Fn(i32) -> Result<Option<StructType>>,
+        ) -> Result<super::ManifestList> {
+            Ok(super::ManifestList {
+                entries: self
+                    .entries
+                    .into_iter()
+                    .map(|v| {
+                        let partition_spec_id = v.partition_spec_id;
+                        let manifest_path = v.manifest_path.clone();
+                        v.try_into(partition_type_provider(partition_spec_id)?.as_ref())
+                            .map_err(|err| {
+                                err.with_context("manifest file path", manifest_path)
+                                    .with_context(
+                                        "partition spec id",
+                                        partition_spec_id.to_string(),
+                                    )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        }
+    }
 
+    impl TryFrom<super::ManifestList> for ManifestListV2Compat {
+        type Error = Error;
+
+        fn try_from(value: super::ManifestList) -> std::result::Result<Self, Self::Error> {
+            Ok(Self {
+                entries: value
+                    .entries
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            })
+        }
+    }
+    // ----
     impl ManifestListV1 {
         /// Converts the [ManifestListV1] into a [ManifestList].
         /// The convert of [entries] need the partition_type info so use this function instead of [std::TryFrom] trait.
@@ -804,6 +894,25 @@ pub(super) mod _serde {
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     pub(super) struct ManifestFileV2 {
+        pub manifest_path: String,
+        pub manifest_length: i64,
+        pub partition_spec_id: i32,
+        pub content: i32,
+        pub sequence_number: i64,
+        pub min_sequence_number: i64,
+        pub added_snapshot_id: i64,
+        pub added_files_count: i32,
+        pub existing_files_count: i32,
+        pub deleted_files_count: i32,
+        pub added_rows_count: i64,
+        pub existing_rows_count: i64,
+        pub deleted_rows_count: i64,
+        pub partitions: Option<Vec<FieldSummary>>,
+        pub key_metadata: Option<ByteBuf>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    pub(super) struct ManifestFileV2Compat {
         pub manifest_path: String,
         pub manifest_length: i64,
         pub partition_spec_id: i32,
@@ -895,6 +1004,30 @@ pub(super) mod _serde {
                 sequence_number: self.sequence_number,
                 min_sequence_number: self.min_sequence_number,
                 added_snapshot_id: self.added_snapshot_id,
+                added_data_files_count: Some(self.added_files_count.try_into()?),
+                existing_data_files_count: Some(self.existing_files_count.try_into()?),
+                deleted_data_files_count: Some(self.deleted_files_count.try_into()?),
+                added_rows_count: Some(self.added_rows_count.try_into()?),
+                existing_rows_count: Some(self.existing_rows_count.try_into()?),
+                deleted_rows_count: Some(self.deleted_rows_count.try_into()?),
+                partitions,
+                key_metadata: self.key_metadata.map(|b| b.into_vec()).unwrap_or_default(),
+            })
+        }
+    }
+    impl ManifestFileV2Compat {
+        /// Converts the [ManifestFileV2Compat] into a [ManifestFile].
+        /// The convert of [partitions] need the partition_type info so use this function instead of [std::TryFrom] trait.
+        pub fn try_into(self, partition_type: Option<&StructType>) -> Result<ManifestFile> {
+            let partitions = try_convert_to_field_summary(self.partitions, partition_type)?;
+            Ok(ManifestFile {
+                manifest_path: self.manifest_path,
+                manifest_length: self.manifest_length,
+                partition_spec_id: self.partition_spec_id,
+                content: self.content.try_into()?,
+                sequence_number: self.sequence_number,
+                min_sequence_number: self.min_sequence_number,
+                added_snapshot_id: self.added_snapshot_id,
                 added_data_files_count: Some(self.added_data_files_count.try_into()?),
                 existing_data_files_count: Some(self.existing_data_files_count.try_into()?),
                 deleted_data_files_count: Some(self.deleted_data_files_count.try_into()?),
@@ -975,6 +1108,80 @@ pub(super) mod _serde {
     }
 
     impl TryFrom<ManifestFile> for ManifestFileV2 {
+        type Error = Error;
+
+        fn try_from(value: ManifestFile) -> std::result::Result<Self, Self::Error> {
+            let partitions = convert_to_serde_field_summary(value.partitions);
+            let key_metadata = convert_to_serde_key_metadata(value.key_metadata);
+            Ok(Self {
+                manifest_path: value.manifest_path,
+                manifest_length: value.manifest_length,
+                partition_spec_id: value.partition_spec_id,
+                content: value.content as i32,
+                sequence_number: value.sequence_number,
+                min_sequence_number: value.min_sequence_number,
+                added_snapshot_id: value.added_snapshot_id,
+                added_files_count: value
+                    .added_data_files_count
+                    .ok_or_else(|| {
+                        Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            "added_data_files_count in ManifestFileV2 should be require",
+                        )
+                    })?
+                    .try_into()?,
+                existing_files_count: value
+                    .existing_data_files_count
+                    .ok_or_else(|| {
+                        Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            "existing_data_files_count in ManifestFileV2 should be require",
+                        )
+                    })?
+                    .try_into()?,
+                deleted_files_count: value
+                    .deleted_data_files_count
+                    .ok_or_else(|| {
+                        Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            "deleted_data_files_count in ManifestFileV2 should be require",
+                        )
+                    })?
+                    .try_into()?,
+                added_rows_count: value
+                    .added_rows_count
+                    .ok_or_else(|| {
+                        Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            "added_rows_count in ManifestFileV2 should be require",
+                        )
+                    })?
+                    .try_into()?,
+                existing_rows_count: value
+                    .existing_rows_count
+                    .ok_or_else(|| {
+                        Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            "existing_rows_count in ManifestFileV2 should be require",
+                        )
+                    })?
+                    .try_into()?,
+                deleted_rows_count: value
+                    .deleted_rows_count
+                    .ok_or_else(|| {
+                        Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            "deleted_rows_count in ManifestFileV2 should be require",
+                        )
+                    })?
+                    .try_into()?,
+                partitions,
+                key_metadata,
+            })
+        }
+    }
+
+    impl TryFrom<ManifestFile> for ManifestFileV2Compat {
         type Error = Error;
 
         fn try_from(value: ManifestFile) -> std::result::Result<Self, Self::Error> {
