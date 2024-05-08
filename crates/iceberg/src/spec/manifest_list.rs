@@ -17,10 +17,13 @@
 
 //! ManifestList for Iceberg.
 
+use std::hash::Hash;
 use std::{collections::HashMap, str::FromStr};
 
 use crate::io::FileIO;
 use crate::{io::OutputFile, spec::Literal, Error, ErrorKind};
+use apache_avro::schema::RecordSchema;
+use apache_avro::AvroSchema;
 use apache_avro::{from_value, types::Value, Reader, Writer};
 use futures::{AsyncReadExt, AsyncWriteExt};
 
@@ -29,7 +32,7 @@ use self::{
     _serde::{ManifestFileV1, ManifestFileV2},
 };
 
-use super::{FormatVersion, Manifest, StructType};
+use super::{manifest, FormatVersion, Manifest, StructType};
 use crate::error::Result;
 
 /// Placeholder for sequence number. The field with this value must be replaced with the actual sequence number before it write.
@@ -68,9 +71,44 @@ impl ManifestList {
                 from_value::<_serde::ManifestListV1>(&values)?.try_into(partition_type_provider)
             }
             FormatVersion::V2 => {
-                let reader = Reader::with_schema(&MANIFEST_LIST_AVRO_SCHEMA_V2, bs)?;
-                let values = Value::Array(reader.collect::<std::result::Result<Vec<Value>, _>>()?);
-                from_value::<_serde::ManifestListV2>(&values)?.try_into(partition_type_provider)
+                // 1. get a hashmap that maps the field_id to the field_name in the Manifest's schema
+                let manifest_file_schema =
+                    Self::get_record_schema(MANIFEST_LIST_AVRO_SCHEMA_V2.clone())?;
+                let manifest_file_schema_fields =
+                    Self::get_manifest_schema_fields_map(manifest_file_schema, true)?;
+
+                // 2. get a hashmap that maps field_name to field_id in the schema of the read avro file
+                let reader = Reader::new(bs)?;
+                let file_schema = Self::get_record_schema(reader.writer_schema().clone())?;
+                let file_schema_fields: HashMap<String, String> =
+                    Self::get_manifest_schema_fields_map(file_schema, false)?;
+
+                // 3. get a vec of records from the read avro file .
+                // each record is a hashmap of field_id and field_value
+                let file_records = reader.collect::<std::result::Result<Vec<Value>, _>>()?;
+                let file_records_values_map =
+                    Self::get_avro_records_as_map(file_records, file_schema_fields)?;
+
+                // 4. for each record (manifest file) in the Avro file records maps,
+                // traverse the schema of the manifest file: for each field id in the schema, get the field value from the record
+                let manifest_records: Vec<Value> = file_records_values_map
+                    .into_iter()
+                    .map(|file_record_fields| {
+                        let fields_values: Vec<_> = manifest_file_schema_fields
+                            .iter()
+                            .filter_map(|(schem_field_id, schem_field_name)| {
+                                file_record_fields
+                                    .get(schem_field_id)
+                                    .map(|value| (schem_field_name.clone(), value.clone()))
+                            })
+                            .collect();
+                        Value::Record(fields_values)
+                    })
+                    .collect();
+
+                let values = Value::Array(manifest_records);
+                let manifest = from_value::<_serde::ManifestListV2>(&values)?;
+                manifest.try_into(partition_type_provider)
             }
         }
     }
@@ -78,6 +116,57 @@ impl ManifestList {
     /// Get the entries in the manifest list.
     pub fn entries(&self) -> &[ManifestFile] {
         &self.entries
+    }
+
+    /// extract the schema record from the avro schema
+    pub fn get_record_schema(avro_schema: apache_avro::schema::Schema) -> Result<RecordSchema> {
+        if let apache_avro::Schema::Record(schema) = avro_schema {
+            Ok(schema)
+        } else {
+            Err(Error::new(ErrorKind::DataInvalid, "Schema is not a record"))
+        }
+    }
+    /// extract the schema fields from the record schema in the shape of a hashmap<field_id, field_name>
+    pub fn get_manifest_schema_fields_map(
+        schema: RecordSchema,
+        id2name: bool,
+    ) -> Result<HashMap<String, String>> {
+        Ok(schema
+            .fields
+            .iter()
+            .map(|field| {
+                let field_id = field.custom_attributes.get("field-id").unwrap().to_string();
+                let field_name = field.name.clone();
+                match id2name {
+                    true => (field_id, field_name),
+                    false => (field_name, field_id),
+                }
+            })
+            .collect::<HashMap<String, String>>())
+    }
+    /// Maps avro records to a hashmap of field_id ([`String`]) and field_value ([`Value`])
+    pub fn get_avro_records_as_map(
+        records: Vec<Value>,
+        schema_fields_map: HashMap<String, String>,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        let mut file_records_values: Vec<HashMap<String, Value>> = Vec::new();
+        records.into_iter().for_each(|record| {
+            if let Value::Record(fields) = record {
+                let fields_values = fields
+                    .into_iter()
+                    .map(|field| {
+                        let field_name = field.0;
+                        let field_value = field.1;
+                        println!("field_name: {}, field_value: {:?}", field_name, field_value);
+                        // bring the id from the schema
+                        let field_id = schema_fields_map.get(&field_name).unwrap();
+                        (field_id.clone(), field_value)
+                    })
+                    .collect::<HashMap<String, Value>>();
+                file_records_values.push(fields_values);
+            }
+        });
+        Ok(file_records_values)
     }
 }
 
